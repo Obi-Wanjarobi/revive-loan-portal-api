@@ -41,6 +41,7 @@ class Loan(Base):
 
     stage = Column(String, nullable=False, default="Application")
     # Application, Processing, Underwriting, Conditions, Clear to Close, Funded, On Hold, Withdrawn
+    stage_date = Column(DateTime(timezone=True), nullable=True)  # when the loan entered its current stage
 
     date_submitted = Column(DateTime(timezone=True), nullable=True)
     est_closing_date = Column(String, nullable=True)   # kept as free text like Pulse's "Jun 5"

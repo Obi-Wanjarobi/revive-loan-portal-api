@@ -56,6 +56,7 @@ class LoanOut(BaseModel):
     apr: Optional[float] = None
     ltv: Optional[str] = None
     stage: Optional[str] = None
+    stage_date: Optional[datetime] = None
     date_submitted: Optional[datetime] = None
     est_closing_date: Optional[str] = None
     rate_lock_expires: Optional[datetime] = None
@@ -81,6 +82,7 @@ class LoanUpsert(BaseModel):
     apr: Optional[float] = None
     ltv: Optional[str] = None
     stage: Optional[str] = None
+    stage_date: Optional[datetime] = None
     date_submitted: Optional[datetime] = None
     est_closing_date: Optional[str] = None
     rate_lock_expires: Optional[datetime] = None
