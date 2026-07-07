@@ -86,6 +86,36 @@ def my_loan(current_borrower: models.Borrower = Depends(auth.get_current_borrowe
 
 
 # ============================================================
+# ADMIN — you (the owner), can log in and view ANY loan by number
+# ============================================================
+
+@app.post("/admin/login", response_model=schemas.TokenResponse)
+def admin_login(payload: schemas.AdminLoginRequest):
+    if not auth.ADMIN_EMAIL or not auth.ADMIN_PASSWORD_HASH:
+        raise HTTPException(status_code=503, detail="Admin login isn't configured yet.")
+    if payload.email.lower() != auth.ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=401, detail="Incorrect email or password.")
+    if not auth.verify_password(payload.password, auth.ADMIN_PASSWORD_HASH):
+        raise HTTPException(status_code=401, detail="Incorrect email or password.")
+    token = auth.create_admin_token()
+    return schemas.TokenResponse(access_token=token)
+
+
+@app.get("/admin/loans", dependencies=[Depends(auth.get_current_admin)])
+def admin_list_loans(db: Session = Depends(get_db)):
+    loans = db.query(models.Loan).all()
+    return [{"loan_number": l.loan_number, "borrower_name": l.borrower_name, "stage": l.stage} for l in loans]
+
+
+@app.get("/admin/loans/{loan_number}", response_model=schemas.LoanOut, dependencies=[Depends(auth.get_current_admin)])
+def admin_get_loan(loan_number: str, db: Session = Depends(get_db)):
+    loan = db.query(models.Loan).filter(models.Loan.loan_number == loan_number).first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="No loan found with that number.")
+    return loan
+
+
+# ============================================================
 # INTERNAL — Pulse CRM pushes updates here (API-key locked, never exposed to borrowers)
 # ============================================================
 

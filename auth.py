@@ -25,6 +25,9 @@ ACCESS_TOKEN_EXPIRE_HOURS = 24 * 14  # borrowers stay logged in for 2 weeks
 
 INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "CHANGE_ME_IN_RAILWAY_VARIABLES")
 
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 
@@ -34,6 +37,24 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8")[:72], hashed.encode("utf-8"))
+
+
+def create_admin_token() -> str:
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=12)
+    payload = {"sub": "admin", "role": "admin", "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_admin(token: str = Depends(oauth2_scheme)):
+    """A separate, higher-privilege check — a borrower's token will never pass this."""
+    unauthorized = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session invalid or expired — please log in again.")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("role") != "admin":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    except JWTError:
+        raise unauthorized
+    return True
 
 
 def create_access_token(borrower_id: str) -> str:
