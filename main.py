@@ -7,7 +7,9 @@ Three doors into the same filing cabinet:
   /internal/*  — Pulse CRM pushing loan updates in (staff-only, API-key locked)
 """
 import os
-from fastapi import FastAPI, Depends, HTTPException, status
+from datetime import datetime
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -18,6 +20,8 @@ from database import engine, get_db, Base
 Base.metadata.create_all(bind=engine)  # MVP: auto-create tables. Move to Alembic migrations once this is live.
 
 app = FastAPI(title="Revive Capital Client Portal API")
+
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15MB per file — plenty for a scanned PDF, keeps Postgres storage sane
 
 cors_origins = os.environ.get("CORS_ORIGINS", "*")
 app.add_middleware(
@@ -83,6 +87,67 @@ def my_loan(current_borrower: models.Borrower = Depends(auth.get_current_borrowe
     if not loan:
         raise HTTPException(status_code=404, detail="Loan not found.")
     return loan
+
+
+@app.post("/me/documents", response_model=schemas.DocumentOut)
+async def upload_my_document(
+    file: UploadFile = File(...),
+    doc_type: str = Form(None),
+    current_borrower: models.Borrower = Depends(auth.get_current_borrower),
+    db: Session = Depends(get_db),
+):
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="That file is too large — please keep uploads under 15MB.")
+    doc = models.Document(
+        loan_id=current_borrower.loan_id,
+        filename=file.filename,
+        content_type=file.content_type,
+        data=content,
+        uploaded_by_role="borrower",
+        uploaded_by_name=None,
+        doc_type=doc_type,
+        status="pending",
+    )
+    db.add(doc)
+    db.add(models.ActivityEvent(loan_id=current_borrower.loan_id, text=f"You uploaded {file.filename}"))
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
+@app.get("/me/documents", response_model=list[schemas.DocumentOut])
+def list_my_documents(current_borrower: models.Borrower = Depends(auth.get_current_borrower), db: Session = Depends(get_db)):
+    return (
+        db.query(models.Document)
+        .filter(models.Document.loan_id == current_borrower.loan_id)
+        .order_by(models.Document.created_at.desc())
+        .all()
+    )
+
+
+@app.post("/me/form1003", response_model=schemas.Form1003Out)
+def save_my_1003(payload: schemas.Form1003In, current_borrower: models.Borrower = Depends(auth.get_current_borrower), db: Session = Depends(get_db)):
+    form = db.query(models.Form1003).filter(models.Form1003.loan_id == current_borrower.loan_id).first()
+    if not form:
+        form = models.Form1003(loan_id=current_borrower.loan_id, data={})
+        db.add(form)
+    form.data = payload.data
+    if payload.submit:
+        form.status = "submitted"
+        form.submitted_at = datetime.utcnow()
+        db.add(models.ActivityEvent(loan_id=current_borrower.loan_id, text="You submitted your loan application (1003)"))
+    db.commit()
+    db.refresh(form)
+    return form
+
+
+@app.get("/me/form1003", response_model=schemas.Form1003Out)
+def get_my_1003(current_borrower: models.Borrower = Depends(auth.get_current_borrower), db: Session = Depends(get_db)):
+    form = db.query(models.Form1003).filter(models.Form1003.loan_id == current_borrower.loan_id).first()
+    if not form:
+        return schemas.Form1003Out(data={}, status="draft", submitted_at=None, updated_at=None)
+    return form
 
 
 # ============================================================
@@ -156,3 +221,79 @@ def add_activity(loan_number: str, payload: schemas.ActivityCreate, db: Session 
     db.add(models.ActivityEvent(loan_id=loan.id, text=payload.text))
     db.commit()
     return {"status": "ok"}
+
+
+@app.post("/internal/loans/{loan_number}/documents", response_model=schemas.DocumentOut, dependencies=[Depends(auth.verify_internal_key)])
+async def internal_upload_document(
+    loan_number: str,
+    file: UploadFile = File(...),
+    uploaded_by_role: str = Form(...),   # "lo" | "processor" | "admin"
+    uploaded_by_name: str = Form(None),
+    doc_type: str = Form(None),
+    db: Session = Depends(get_db),
+):
+    loan = db.query(models.Loan).filter(models.Loan.loan_number == loan_number).first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Unknown loan number.")
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="That file is too large — please keep uploads under 15MB.")
+    doc = models.Document(
+        loan_id=loan.id,
+        filename=file.filename,
+        content_type=file.content_type,
+        data=content,
+        uploaded_by_role=uploaded_by_role,
+        uploaded_by_name=uploaded_by_name,
+        doc_type=doc_type,
+        status="pending",
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
+@app.get("/internal/loans/{loan_number}/documents", response_model=list[schemas.DocumentOut], dependencies=[Depends(auth.verify_internal_key)])
+def internal_list_documents(loan_number: str, db: Session = Depends(get_db)):
+    loan = db.query(models.Loan).filter(models.Loan.loan_number == loan_number).first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Unknown loan number.")
+    return (
+        db.query(models.Document)
+        .filter(models.Document.loan_id == loan.id)
+        .order_by(models.Document.created_at.desc())
+        .all()
+    )
+
+
+@app.get("/internal/documents/{document_id}/download", dependencies=[Depends(auth.verify_internal_key)])
+def internal_download_document(document_id: str, db: Session = Depends(get_db)):
+    """Pulse fetches the raw file bytes here to feed into Doc Intelligence for AI review."""
+    doc = db.query(models.Document).filter(models.Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return Response(content=doc.data, media_type=doc.content_type or "application/octet-stream",
+                     headers={"Content-Disposition": f'inline; filename="{doc.filename}"'})
+
+
+@app.patch("/internal/documents/{document_id}/status", dependencies=[Depends(auth.verify_internal_key)])
+def internal_mark_document_status(document_id: str, status_value: str = Form(...), db: Session = Depends(get_db)):
+    """Pulse calls this after running a document through Doc Intelligence, so the portal/CRM both know it's been reviewed."""
+    doc = db.query(models.Document).filter(models.Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    doc.status = status_value
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.get("/internal/loans/{loan_number}/form1003", response_model=schemas.Form1003Out, dependencies=[Depends(auth.verify_internal_key)])
+def internal_get_1003(loan_number: str, db: Session = Depends(get_db)):
+    loan = db.query(models.Loan).filter(models.Loan.loan_number == loan_number).first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Unknown loan number.")
+    form = db.query(models.Form1003).filter(models.Form1003.loan_id == loan.id).first()
+    if not form:
+        return schemas.Form1003Out(data={}, status="draft", submitted_at=None, updated_at=None)
+    return form

@@ -12,7 +12,7 @@ both read/write through this same cabinet, so there's only ever one source
 of truth.
 """
 from sqlalchemy import (
-    Column, String, Integer, Numeric, DateTime, ForeignKey, Boolean, Text
+    Column, String, Integer, Numeric, DateTime, ForeignKey, Boolean, Text, LargeBinary, JSON
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -98,3 +98,50 @@ class Borrower(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     loan = relationship("Loan", back_populates="borrower_account")
+
+
+class Document(Base):
+    """
+    A single uploaded file — borrower-uploaded (via the portal) or
+    staff-uploaded (via Pulse CRM, LO/LOA/Processor). The raw bytes are
+    stored directly in Postgres (bytea) for simplicity — fine for typical
+    mortgage PDFs (a few MB each). If document volume grows large, moving
+    to S3/Railway volume storage later is a clean upgrade path — this
+    schema doesn't need to change, only where `data` physically lives.
+    """
+    __tablename__ = "documents"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    loan_id = Column(String, ForeignKey("loans.id"), nullable=False)
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+    data = Column(LargeBinary, nullable=False)
+    uploaded_by_role = Column(String, nullable=False)   # "borrower" | "lo" | "processor" | "admin"
+    uploaded_by_name = Column(String, nullable=True)
+    doc_type = Column(String, nullable=True)             # e.g. "Conditional Loan Approval", "Pay Stub" — borrower picks from a simple list, staff can leave blank
+    status = Column(String, nullable=False, default="pending")  # pending | analyzed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    loan = relationship("Loan")
+
+
+class Form1003(Base):
+    """
+    Streamlined borrower application intake — NOT a compliance-grade
+    replacement for the final signed 1003/URLA. Covers the fields a loan
+    officer actually needs to start processing a file: borrower/contact
+    info, current address, employment, income, assets, liabilities, and
+    a handful of declarations. Stored as one flexible JSON blob (`data`)
+    rather than dozens of individual columns, since the full URLA has 100+
+    fields and most loans only ever touch a subset of them.
+    """
+    __tablename__ = "form_1003"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    loan_id = Column(String, ForeignKey("loans.id"), unique=True, nullable=False)
+    data = Column(JSON, nullable=False, default=dict)
+    status = Column(String, nullable=False, default="draft")  # draft | submitted
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    loan = relationship("Loan")
