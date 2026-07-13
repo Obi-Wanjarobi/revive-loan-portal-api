@@ -99,3 +99,30 @@ class ConditionUpsert(BaseModel):
 
 class ActivityCreate(BaseModel):
     text: str
+class DocumentOut(BaseModel):
+    id: str
+    filename: str
+    content_type: Optional[str] = None
+    uploaded_by_role: str
+    uploaded_by_name: Optional[str] = None
+    doc_type: Optional[str] = None
+    status: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class Form1003In(BaseModel):
+    data: dict
+    submit: bool = False
+
+
+class Form1003Out(BaseModel):
+    data: dict
+    status: str
+    submitted_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
