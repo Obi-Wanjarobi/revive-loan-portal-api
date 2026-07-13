@@ -297,3 +297,37 @@ def internal_get_1003(loan_number: str, db: Session = Depends(get_db)):
     if not form:
         return schemas.Form1003Out(data={}, status="draft", submitted_at=None, updated_at=None)
     return form
+
+
+# ============================================================
+# PULSE PIPELINE SNAPSHOT — durable server-side backup of Pulse's
+# entire in-browser LOANS + CONTACTS object. Pulse's own UI previously
+# had NO server-side copy of this data at all — only localStorage.
+# This makes every autosave durable, regardless of what happens to any
+# one browser/device. Guarded by the same INTERNAL_API_KEY Pulse
+# already uses for portal sync — no new credential to manage.
+# ============================================================
+
+@app.post("/internal/pulse/snapshot", dependencies=[Depends(auth.verify_internal_key)])
+def save_pulse_snapshot(payload: dict, db: Session = Depends(get_db)):
+    key = payload.get("key", "pipeline")
+    data = payload.get("data")
+    if data is None:
+        raise HTTPException(status_code=422, detail="Missing 'data' field.")
+    snap = db.query(models.PulseSnapshot).filter(models.PulseSnapshot.key == key).first()
+    if not snap:
+        snap = models.PulseSnapshot(key=key, data=data)
+        db.add(snap)
+    else:
+        snap.data = data
+    db.commit()
+    db.refresh(snap)
+    return {"status": "ok", "key": key, "updated_at": snap.updated_at}
+
+
+@app.get("/internal/pulse/snapshot", dependencies=[Depends(auth.verify_internal_key)])
+def get_pulse_snapshot(key: str = "pipeline", db: Session = Depends(get_db)):
+    snap = db.query(models.PulseSnapshot).filter(models.PulseSnapshot.key == key).first()
+    if not snap:
+        return {"key": key, "data": None, "updated_at": None}
+    return {"key": key, "data": snap.data, "updated_at": snap.updated_at}

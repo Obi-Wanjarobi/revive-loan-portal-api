@@ -125,6 +125,30 @@ class Document(Base):
     loan = relationship("Loan")
 
 
+class PulseSnapshot(Base):
+    """
+    A full, durable backup of Pulse's own loan pipeline + contacts — the
+    complete in-app data structure (steps, contacts, disclosure tracking,
+    conditions, everything), not just the subset the client portal needs.
+
+    This exists because Pulse's pipeline previously lived ONLY in browser
+    localStorage — one lost/cleared browser and it was gone, with no
+    server-side copy anywhere. This table is that server-side copy.
+
+    Single-row-per-key design: one row holds the entire org's pipeline as
+    one JSON blob. Simple, and matches how Pulse already treats LOANS as
+    one in-memory object. If per-loan-officer or per-branch snapshots are
+    ever needed, the `key` column already supports that (e.g. "pipeline",
+    "pipeline_branch_irvine") without a schema change.
+    """
+    __tablename__ = "pulse_snapshots"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    key = Column(String, unique=True, index=True, nullable=False, default="pipeline")
+    data = Column(JSON, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class Form1003(Base):
     """
     Streamlined borrower application intake — NOT a compliance-grade
