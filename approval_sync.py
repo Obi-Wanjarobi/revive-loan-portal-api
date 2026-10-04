@@ -318,12 +318,15 @@ def _user():
 _closed_cache = {"at": 0, "files": []}      # Funded/Withdrawn change rarely -> rescan every CLOSED_RESCAN_HOURS
 
 
-def _walk(item_path, status, rel_parts, out, depth=0):
+ALL_ACTIVE_FILES = []                       # every file under Mortgage Processing (for "already on file" checks)
+
+
+def _walk(item_path, status, rel_parts, out, depth=0, all_files=None):
     """List a OneDrive folder and its subfolders (max 5 deep), keeping approval-named PDF/Word files."""
     if depth > 5:
         return
     url = (f"/users/{_user()}/drive/root:/{urllib.parse.quote(item_path)}:/children"
-           f"?$top=200&$select=id,name,eTag,file,folder")
+           f"?$top=200&$select=id,name,eTag,file,folder,lastModifiedDateTime")
     while url:
         page = _graph(url)
         for it in page.get("value", []):
@@ -331,8 +334,10 @@ def _walk(item_path, status, rel_parts, out, depth=0):
             if "folder" in it:
                 if "do not use" in name.lower():
                     continue
-                _walk(f"{item_path}/{name}", status, rel_parts + [name], out, depth + 1)
+                _walk(f"{item_path}/{name}", status, rel_parts + [name], out, depth + 1, all_files)
                 continue
+            if all_files is not None and "file" in it:
+                all_files.append({"rel_parts": rel_parts + [name], "modified": it.get("lastModifiedDateTime")})
             if "file" not in it or not name.lower().endswith((".pdf", ".docx")) or name.startswith("~$"):
                 continue
             if not NAME_HINT.search(name) or NAME_EXCLUDE.search(name):
@@ -346,10 +351,11 @@ def graph_find_files():
     """-> list of {id, name, etag, folder_status, rel_parts} for approval-looking files under the 3 Pipeline folders.
     Walks the folders directly (app-only OneDrive search is blocked on this tenant)."""
     pipeline = os.environ.get("PIPELINE_PATH", "Pipeline").strip("/")
-    out = []
+    out, every = [], []
     for folder, status in STATUS_FOLDERS.items():
         if status == "active":
-            _walk(f"{pipeline}/{folder}", status, [], out)
+            _walk(f"{pipeline}/{folder}", status, [], out, all_files=every)
+    ALL_ACTIVE_FILES[:] = every
     hours = float(os.environ.get("CLOSED_RESCAN_HOURS", "6"))
     if time.time() - _closed_cache["at"] > hours * 3600:
         closed = []
@@ -362,6 +368,77 @@ def graph_find_files():
 
 def graph_download(item_id):
     return _graph(f"/users/{_user()}/drive/items/{item_id}/content", raw=True)
+
+
+# ---------------- "already on file" (don't ask the borrower twice) ----------------
+# (what the condition asks for, file/folder names that satisfy it, file names that must NOT count)
+ON_FILE_RULES = [
+    (r"\bflood", r"flood", None),
+    (r"hazard|homeowner|\bhoi\b|dec(laration)? page|insurance binder", r"\bhoi\b|insur|\bdec(laration)?s?\b|binder|homeowner", r"flood|title"),
+    (r"\blease", r"lease", None),
+    (r"payoff", r"payoff", None),
+    (r"mortgage statement|housing history|mortgage rating|payment history",
+     r"mortgage st|mtg st|newrez|shellpoint|rocket mort|mr\.? ?cooper|nationstar|pennymac|loancare|carrington|lakeview|dovenmuehle|freedom mort", None),
+    (r"bank statement|asset|reserves|funds to close|seasoning", r"bank|estmt|e-?statement|checking|savings|brokerage|\bchase\b|wells|bofa|schwab|fidelity", r"mortgage|newrez|shellpoint"),
+    (r"\bach\b", r"\bach\b", None),
+    (r"identification|\bphoto id|driver'?s? licen|\bid\b", r"\bid\b|licen|passport|\bdl\b", None),
+    (r"apprais|\b1004\b|\b1007\b|\b1025\b|rent schedule", r"apprais|\b1004\b|\b1007\b|\b1025\b", None),
+    (r"letter of explanation|\blox\b|\bloe\b|purpose of the cash|cash-?out letter", r"\blox\b|\bloe\b|explanation", None),
+    (r"\bssn\b|social security|\bssa", r"\bssa|\bssn\b|social security", None),
+    (r"prelim|title commitment|title report", r"prelim|title commit|title report", None),
+    (r"operating agreement|articles of|\bein\b|good standing|entity doc|llc doc", r"operating|articles|\bein\b|good standing|formation|\bllc doc", None),
+    (r"tax return|\b1040|transcript", r"\b1040|tax return|transcript", None),
+    (r"pay ?stub|\bw-?2\b|\bvoe\b|employment history", r"pay ?stub|\bw-?2\b|\bvoe\b", None),
+]
+ON_FILE_NOTE = ("📄 We already have this on file (received {when}) - it's with the lender for review. "
+                "No need to send it again unless your processor asks for an updated copy. ")
+
+
+def _scoped_files(approval_rel_parts, doc_key, files):
+    """Files belonging to this loan: its property folder (+ subfolders) and the borrower's shared, non-property folders."""
+    if not approval_rel_parts:
+        return []
+    borrower = approval_rel_parts[0]
+    out = []
+    for f in files:
+        parts = f["rel_parts"]
+        if not parts or parts[0] != borrower:
+            continue
+        inner = parts[1:-1]                                           # folders between borrower and file
+        if any("do not use" in p.lower() for p in inner):
+            continue
+        prop = [p for p in inner if addr_key(p)]
+        if prop and addr_key(prop[0]) != doc_key:
+            continue                                                  # another property's folder
+        if NAME_HINT.search(parts[-1]) and re.search(r"approval|decision", parts[-1], re.I):
+            continue                                                  # the approvals themselves
+        out.append(f)
+    return out
+
+
+def annotate_on_file(conditions, scoped, uploads):
+    """Mark conditions whose document is already in the loan's folder or was uploaded in the portal (stays OPEN)."""
+    pool = [("/".join(f["rel_parts"]).lower(), (f.get("modified") or "")[:10]) for f in scoped]
+    pool += [(f"{u.filename} {u.doc_type or ''}".lower(), str(u.created_at or "")[:10]) for u in uploads]
+    out = []
+    for c in conditions:
+        c = dict(c)
+        text = f"{c['title']} {c.get('detail', '')}".lower()
+        hits = []
+        for cond_pat, file_pat, not_pat in ON_FILE_RULES:
+            if re.search(cond_pat, text, re.I):
+                hits += [d for name, d in pool if re.search(file_pat, name, re.I) and not (not_pat and re.search(not_pat, name, re.I))]
+                break
+        if hits:
+            latest = max(hits) if any(hits) else ""
+            try:
+                when = dt.datetime.strptime(latest, "%Y-%m-%d").strftime("%b %d").replace(" 0", " ")
+            except Exception:
+                when = "earlier"
+            c["detail"] = ON_FILE_NOTE.format(when=when) + (c.get("detail") or "")
+            c["on_file"] = True
+        out.append(c)
+    return out
 
 
 # ---------------- merge into the portal DB ----------------
@@ -409,7 +486,7 @@ STATUS = {"enabled": False, "running": False, "last_started": None, "last_finish
 _lock = threading.Lock()
 
 
-def run_once(dry_run=False, files=None, download=None):
+def run_once(dry_run=False, files=None, download=None, all_files=None):
     """files/download are injectable for tests; production uses Microsoft Graph."""
     if not _lock.acquire(blocking=False):
         return {"status": "already running"}
@@ -417,6 +494,7 @@ def run_once(dry_run=False, files=None, download=None):
     db = SessionLocal()
     try:
         files = files if files is not None else graph_find_files()
+        all_files = all_files if all_files is not None else list(ALL_ACTIVE_FILES)
         download = download or graph_download
         loans = db.query(models.Loan).all()
         by_addr = {}
@@ -487,20 +565,24 @@ def run_once(dry_run=False, files=None, download=None):
                 skipped["portal_closed"] += 1; continue
             rank = (date_key(doc["printed"] or ""), date_key(doc["approval_date"] or ""))
             if loan.loan_number not in best or rank > best[loan.loan_number][0]:
-                best[loan.loan_number] = (rank, loan, doc, f["rel"])
+                best[loan.loan_number] = (rank, loan, doc, f["rel"], f["rel_parts"])
         for ln, st in closed.items():
             if ln in best:
                 help_items.append({"file": best[ln][3], "why": f"{ln} also has an approval in Mortgage {st.title()} - treated as closed. Not pushed."})
                 del best[ln]
 
         pushed = []
-        for ln, (rank, loan, doc, rel) in sorted(best.items()):
+        for ln, (rank, loan, doc, rel, rel_parts) in sorted(best.items()):
+            scoped = _scoped_files(rel_parts, addr_key(doc["address"]), all_files)
+            uploads = db.query(models.Document).filter(models.Document.loan_id == loan.id).all()
+            conds = annotate_on_file(doc["conditions"], scoped, uploads)
             res = {"loan": ln, "borrower": loan.borrower_name, "lender": doc["lender"], "file": rel,
-                   "approval_date": doc["approval_date"] or doc["printed"], "conditions": len(doc["conditions"])}
+                   "approval_date": doc["approval_date"] or doc["printed"], "conditions": len(conds),
+                   "already_on_file": [c["title"] for c in conds if c.get("on_file")]}
             if dry_run:
-                res["titles"] = [c["title"] for c in doc["conditions"]]
+                res["titles"] = [c["title"] for c in conds]
             else:
-                res.update(merge_approval(db, loan, doc["conditions"], doc["approval_date"] or doc["printed"]))
+                res.update(merge_approval(db, loan, conds, doc["approval_date"] or doc["printed"]))
             pushed.append(res)
         STATUS.update(pushed=pushed, help=help_items, skipped=skipped, files_seen=len(files), dry_run=dry_run)
         return {"dry_run": dry_run, "pushed": pushed, "help": help_items, "skipped": skipped, "files_seen": len(files)}
