@@ -70,6 +70,11 @@ class LoanOut(BaseModel):
         from_attributes = True
 
 
+class AdminLoanOut(LoanOut):
+    """Admin-only view: adds borrower_email so the invite form can auto-fill."""
+    borrower_email: Optional[str] = None
+
+
 # ---------- Internal sync (Pulse -> backend) ----------
 class LoanUpsert(BaseModel):
     loan_number: str
@@ -95,6 +100,13 @@ class ConditionUpsert(BaseModel):
     title: str
     detail: Optional[str] = None
     done: bool = False
+
+
+class ApprovalConditionsIn(BaseModel):
+    """Conditions parsed from the lender's Loan Decision (Approval) PDF."""
+    approval_date: Optional[str] = None
+    source_file: Optional[str] = None
+    conditions: List[ConditionUpsert]
 
 
 class ActivityCreate(BaseModel):
