@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
-import models, schemas, auth
+import models, schemas, auth, approval_sync
 from database import engine, get_db, Base
 
 Base.metadata.create_all(bind=engine)  # MVP: auto-create tables. Move to Alembic migrations once this is live.
@@ -217,8 +217,25 @@ def sync_conditions(loan_number: str, conditions: list[schemas.ConditionUpsert],
     return {"status": "ok", "count": len(conditions)}
 
 
-def _cond_key(title: str) -> str:
-    return " ".join((title or "").lower().split())
+# ---------- Automatic approval-conditions sync (OneDrive -> portal) ----------
+@app.on_event("startup")
+def _start_approval_sync():
+    approval_sync.start_scheduler()
+
+
+@app.get("/admin/approval-sync/status", dependencies=[Depends(auth.get_current_admin)])
+def approval_sync_status():
+    return {**approval_sync.STATUS, "enabled": approval_sync.enabled()}
+
+
+@app.post("/admin/approval-sync/run", dependencies=[Depends(auth.get_current_admin)])
+def approval_sync_run(dry_run: bool = True):
+    """Run now. dry_run=true (default) shows what would change without writing."""
+    if not approval_sync.enabled():
+        raise HTTPException(status_code=400, detail="Approval sync is not configured (MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET).")
+    import threading
+    threading.Thread(target=approval_sync.run_once, kwargs={"dry_run": dry_run}, daemon=True).start()
+    return {"status": "started", "dry_run": dry_run, "check": "/admin/approval-sync/status"}
 
 
 @app.get("/internal/loans", dependencies=[Depends(auth.verify_internal_key)])
@@ -242,34 +259,9 @@ def sync_conditions_from_approval(loan_number: str, payload: schemas.ApprovalCon
     if not payload.conditions:
         raise HTTPException(status_code=400, detail="No conditions in payload; nothing changed.")
 
-    existing = {_cond_key(c.title): c for c in db.query(models.Condition).filter(models.Condition.loan_id == loan.id).all()}
-    incoming = {}
-    for c in payload.conditions:
-        incoming.setdefault(_cond_key(c.title), c)
-
-    added = cleared = reopened = 0
-    now = datetime.utcnow()
-    for key, c in incoming.items():
-        row = existing.get(key)
-        if row is None:
-            db.add(models.Condition(loan_id=loan.id, title=c.title, detail=c.detail, done=False))
-            added += 1
-        else:
-            row.detail = c.detail
-            if row.done:
-                row.done, row.completed_at = False, None
-                reopened += 1
-    for key, row in existing.items():
-        if key not in incoming and not row.done:
-            row.done, row.completed_at = True, now
-            cleared += 1
-
-    if added or cleared or reopened:
-        when = f" ({payload.approval_date})" if payload.approval_date else ""
-        parts = [f"{n} {w}" for n, w in ((added, "new"), (cleared, "cleared"), (reopened, "reopened")) if n]
-        db.add(models.ActivityEvent(loan_id=loan.id, text=f"Lender approval updated{when}: " + ", ".join(parts) + " condition(s)."))
-    db.commit()
-    return {"status": "ok", "open": len(incoming), "added": added, "cleared": cleared, "reopened": reopened}
+    result = approval_sync.merge_approval(db, loan, [{"title": c.title, "detail": c.detail} for c in payload.conditions],
+                                          payload.approval_date)
+    return {"status": "ok", **result}
 
 
 @app.post("/internal/loans/{loan_number}/activity", dependencies=[Depends(auth.verify_internal_key)])
