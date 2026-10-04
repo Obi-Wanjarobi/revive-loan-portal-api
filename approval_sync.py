@@ -14,7 +14,7 @@ Turns on only when these Railway variables are set (Boss enters the secret):
 Optional: ONEDRIVE_USER (default jturner@myrevivecapital.com), PIPELINE_PATH (default Pipeline),
           APPROVAL_SYNC_MINUTES (default 30), APPROVAL_SYNC_ENABLED=0 to pause.
 """
-import datetime as dt, io, json, os, re, threading, time, traceback, urllib.parse, urllib.request, zipfile
+import datetime as dt, io, json, os, re, threading, time, traceback, urllib.error, urllib.parse, urllib.request, zipfile
 
 import models
 from database import SessionLocal
@@ -268,18 +268,28 @@ def _graph_token():
     body = urllib.parse.urlencode({"client_id": c["MS_CLIENT_ID"], "client_secret": c["MS_CLIENT_SECRET"],
                                    "scope": "https://graph.microsoft.com/.default", "grant_type": "client_credentials"}).encode()
     req = urllib.request.Request(f"https://login.microsoftonline.com/{c['MS_TENANT_ID']}/oauth2/v2.0/token", data=body)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        j = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            j = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Microsoft login {e.code}: {e.read()[:300].decode('utf8', 'ignore')}")
     _token.update(value=j["access_token"], exp=time.time() + int(j.get("expires_in", 3600)))
     return _token["value"]
 
 
-def _graph(url, raw=False):
+def _graph(url, raw=False, _retry=True):
     if url.startswith("/"):
         url = "https://graph.microsoft.com/v1.0" + url
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + _graph_token()})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        data = r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and _retry:            # stale token (e.g. issued before admin consent) -> get a fresh one once
+            _token.update(value=None, exp=0)
+            return _graph(url, raw, _retry=False)
+        detail = e.read()[:400].decode("utf8", "ignore")
+        raise RuntimeError(f"Graph {e.code} on {url.split('?')[0][-90:]}: {detail}")
     return data if raw else json.loads(data)
 
 
