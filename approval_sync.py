@@ -23,7 +23,6 @@ STATUS_FOLDERS = {"Mortgage Processing": "active", "Mortgage Funded": "funded", 
 ACTIVE_PORTAL_STAGES = {"application", "processing", "underwriting", "conditions", "clear to close"}
 NAME_HINT = re.compile(r"approval|decision|condition", re.I)
 NAME_EXCLUDE = re.compile(r"pre[\s\-_]?approval|pre[\s\-_]?qual", re.I)
-SEARCH_TERMS = ["approval", "decision", "conditional"]
 
 # Items a borrower can't act on (broker / lender / title back-office). Case-insensitive, matched on title+detail.
 HIDE = [
@@ -297,33 +296,49 @@ def _user():
     return urllib.parse.quote(os.environ.get("ONEDRIVE_USER", "jturner@myrevivecapital.com"))
 
 
+_closed_cache = {"at": 0, "files": []}      # Funded/Withdrawn change rarely -> rescan every CLOSED_RESCAN_HOURS
+
+
+def _walk(item_path, status, rel_parts, out, depth=0):
+    """List a OneDrive folder and its subfolders (max 5 deep), keeping approval-named PDF/Word files."""
+    if depth > 5:
+        return
+    url = (f"/users/{_user()}/drive/root:/{urllib.parse.quote(item_path)}:/children"
+           f"?$top=200&$select=id,name,eTag,file,folder")
+    while url:
+        page = _graph(url)
+        for it in page.get("value", []):
+            name = it["name"]
+            if "folder" in it:
+                if "do not use" in name.lower():
+                    continue
+                _walk(f"{item_path}/{name}", status, rel_parts + [name], out, depth + 1)
+                continue
+            if "file" not in it or not name.lower().endswith((".pdf", ".docx")) or name.startswith("~$"):
+                continue
+            if not NAME_HINT.search(name) or NAME_EXCLUDE.search(name):
+                continue
+            out.append({"id": it["id"], "name": name, "etag": it.get("eTag"), "folder_status": status,
+                        "rel_parts": rel_parts + [name], "rel": "/".join([item_path.split("/", 1)[-1]] + [name])})
+        url = page.get("@odata.nextLink")
+
+
 def graph_find_files():
-    """-> list of {id, name, etag, folder_status, rel_parts} for approval-looking files under the 3 Pipeline folders."""
+    """-> list of {id, name, etag, folder_status, rel_parts} for approval-looking files under the 3 Pipeline folders.
+    Walks the folders directly (app-only OneDrive search is blocked on this tenant)."""
     pipeline = os.environ.get("PIPELINE_PATH", "Pipeline").strip("/")
-    seen, out = set(), []
-    for term in SEARCH_TERMS:
-        url = f"/users/{_user()}/drive/root/search(q='{term}')?$top=200&$select=id,name,eTag,parentReference,file"
-        while url:
-            page = _graph(url)
-            for it in page.get("value", []):
-                if it["id"] in seen or "file" not in it:
-                    continue
-                name = it["name"]
-                if not name.lower().endswith((".pdf", ".docx")) or name.startswith("~$"):
-                    continue
-                if not NAME_HINT.search(name) or NAME_EXCLUDE.search(name):
-                    continue
-                path = urllib.parse.unquote((it.get("parentReference") or {}).get("path", "")).split("root:", 1)[-1].strip("/")
-                parts = [p for p in path.split("/") if p]
-                if len(parts) < 2 or parts[0] != pipeline or parts[1] not in STATUS_FOLDERS:
-                    continue
-                if any("do not use" in p.lower() for p in parts):
-                    continue
-                seen.add(it["id"])
-                out.append({"id": it["id"], "name": name, "etag": it.get("eTag"), "folder_status": STATUS_FOLDERS[parts[1]],
-                            "rel_parts": parts[2:] + [name], "rel": "/".join(parts[1:] + [name])})
-            url = page.get("@odata.nextLink")
-    return out
+    out = []
+    for folder, status in STATUS_FOLDERS.items():
+        if status == "active":
+            _walk(f"{pipeline}/{folder}", status, [], out)
+    hours = float(os.environ.get("CLOSED_RESCAN_HOURS", "6"))
+    if time.time() - _closed_cache["at"] > hours * 3600:
+        closed = []
+        for folder, status in STATUS_FOLDERS.items():
+            if status != "active":
+                _walk(f"{pipeline}/{folder}", status, [], closed)
+        _closed_cache.update(at=time.time(), files=closed)
+    return out + _closed_cache["files"]
 
 
 def graph_download(item_id):
