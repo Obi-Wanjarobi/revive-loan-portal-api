@@ -169,10 +169,10 @@ def admin_login(payload: schemas.AdminLoginRequest):
 @app.get("/admin/loans", dependencies=[Depends(auth.get_current_admin)])
 def admin_list_loans(db: Session = Depends(get_db)):
     loans = db.query(models.Loan).all()
-    return [{"loan_number": l.loan_number, "borrower_name": l.borrower_name, "stage": l.stage} for l in loans]
+    return [{"loan_number": l.loan_number, "borrower_name": l.borrower_name, "borrower_email": l.borrower_email, "stage": l.stage} for l in loans]
 
 
-@app.get("/admin/loans/{loan_number}", response_model=schemas.LoanOut, dependencies=[Depends(auth.get_current_admin)])
+@app.get("/admin/loans/{loan_number}", response_model=schemas.AdminLoanOut, dependencies=[Depends(auth.get_current_admin)])
 def admin_get_loan(loan_number: str, db: Session = Depends(get_db)):
     loan = db.query(models.Loan).filter(models.Loan.loan_number == loan_number).first()
     if not loan:
@@ -206,11 +206,70 @@ def sync_conditions(loan_number: str, conditions: list[schemas.ConditionUpsert],
     if not loan:
         raise HTTPException(status_code=404, detail="Unknown loan number.")
 
+    # Guard: an empty push must not wipe conditions that came from the lender approval.
+    if not conditions and db.query(models.Condition).filter(models.Condition.loan_id == loan.id).count():
+        return {"status": "skipped_empty", "count": 0}
+
     db.query(models.Condition).filter(models.Condition.loan_id == loan.id).delete()
     for c in conditions:
         db.add(models.Condition(loan_id=loan.id, title=c.title, detail=c.detail, done=c.done))
     db.commit()
     return {"status": "ok", "count": len(conditions)}
+
+
+def _cond_key(title: str) -> str:
+    return " ".join((title or "").lower().split())
+
+
+@app.get("/internal/loans", dependencies=[Depends(auth.verify_internal_key)])
+def internal_list_loans(db: Session = Depends(get_db)):
+    """Lightweight list so the approval-sync script can match OneDrive folders to loans."""
+    loans = db.query(models.Loan).all()
+    return [{"loan_number": l.loan_number, "borrower_name": l.borrower_name,
+             "property_address": l.property_address, "stage": l.stage} for l in loans]
+
+
+@app.post("/internal/loans/{loan_number}/conditions/approval", dependencies=[Depends(auth.verify_internal_key)])
+def sync_conditions_from_approval(loan_number: str, payload: schemas.ApprovalConditionsIn, db: Session = Depends(get_db)):
+    """Merge conditions from the latest lender approval PDF.
+    - On the new approval and not on file  -> added as open
+    - On file, missing from the new approval -> marked cleared (borrower sees the checkmark)
+    - Previously cleared but back on the approval -> reopened
+    """
+    loan = db.query(models.Loan).filter(models.Loan.loan_number == loan_number).first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Unknown loan number.")
+    if not payload.conditions:
+        raise HTTPException(status_code=400, detail="No conditions in payload; nothing changed.")
+
+    existing = {_cond_key(c.title): c for c in db.query(models.Condition).filter(models.Condition.loan_id == loan.id).all()}
+    incoming = {}
+    for c in payload.conditions:
+        incoming.setdefault(_cond_key(c.title), c)
+
+    added = cleared = reopened = 0
+    now = datetime.utcnow()
+    for key, c in incoming.items():
+        row = existing.get(key)
+        if row is None:
+            db.add(models.Condition(loan_id=loan.id, title=c.title, detail=c.detail, done=False))
+            added += 1
+        else:
+            row.detail = c.detail
+            if row.done:
+                row.done, row.completed_at = False, None
+                reopened += 1
+    for key, row in existing.items():
+        if key not in incoming and not row.done:
+            row.done, row.completed_at = True, now
+            cleared += 1
+
+    if added or cleared or reopened:
+        when = f" ({payload.approval_date})" if payload.approval_date else ""
+        parts = [f"{n} {w}" for n, w in ((added, "new"), (cleared, "cleared"), (reopened, "reopened")) if n]
+        db.add(models.ActivityEvent(loan_id=loan.id, text=f"Lender approval updated{when}: " + ", ".join(parts) + " condition(s)."))
+    db.commit()
+    return {"status": "ok", "open": len(incoming), "added": added, "cleared": cleared, "reopened": reopened}
 
 
 @app.post("/internal/loans/{loan_number}/activity", dependencies=[Depends(auth.verify_internal_key)])
