@@ -237,12 +237,31 @@ def folder_address_conflict(rel_parts, doc_key):
 
 
 
+def _docx_text(xml):
+    """Word text with automatic list numbering written out ("1. ", "2. "...), restarting at each "Prior to ..." heading."""
+    out, counters = [], {}
+    for p in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S):
+        text = "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", p))
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
+        if re.match(r"Prior\s*to\s*(Final\s+)?(Approval|Docs|Closing|Fund)", text, re.I) and len(text) < 40:
+            counters.clear()
+        lvl = re.search(r'<w:ilvl w:val="(\d+)"', p)
+        nid = re.search(r'<w:numId w:val="(\d+)"', p)
+        styled = re.search(r'<w:pStyle w:val="List ?Number', p)
+        if text and (nid and nid.group(1) != "0" or styled) and (not lvl or lvl.group(1) == "0") \
+                and not re.match(r"\d{1,2}\.\s", text):
+            key = nid.group(1) if nid else "style"
+            counters[key] = counters.get(key, 0) + 1
+            text = f"{counters[key]}. {text}"
+        out.append(text)
+    return "\n".join(out)
+
+
 def read_bytes(name, data):
     if name.lower().endswith(".docx"):
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             xml = z.read("word/document.xml").decode("utf8", "ignore")
-        xml = re.sub(r"</w:p>|<w:tab/>|<w:br/>", "\n", xml)
-        return re.sub(r"<[^>]+>", "", xml).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        return _docx_text(xml)
     from pypdf import PdfReader
     return "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(data)).pages)
 
@@ -366,15 +385,21 @@ def merge_approval(db, loan, conditions, approval_date=None):
             row.detail = c.get("detail")
             if row.done:
                 row.done, row.completed_at = False, None; reopened += 1
+    removed = 0
     for key, row in existing.items():
-        if key not in incoming and not row.done:
+        if key in incoming:
+            continue
+        full = f"{row.title} {row.detail or ''}"
+        if any(re.search(p, full, re.I) for p in HIDE):     # template blanks / back-office items: remove, don't show as cleared
+            db.delete(row); removed += 1
+        elif not row.done:
             row.done, row.completed_at = True, now; cleared += 1
     if added or cleared or reopened:
         when = f" ({approval_date})" if approval_date else ""
         parts = [f"{n} {w}" for n, w in ((added, "new"), (cleared, "cleared"), (reopened, "reopened")) if n]
         db.add(models.ActivityEvent(loan_id=loan.id, text=f"Lender approval updated{when}: " + ", ".join(parts) + " condition(s)."))
     db.commit()
-    return {"open": len(incoming), "added": added, "cleared": cleared, "reopened": reopened}
+    return {"open": len(incoming), "added": added, "cleared": cleared, "reopened": reopened, "removed": removed}
 
 
 # ---------------- one run ----------------
@@ -396,6 +421,8 @@ def run_once(dry_run=False, files=None, download=None):
         loans = db.query(models.Loan).all()
         by_addr = {}
         for l in loans:
+            if re.match(r"LN-", l.loan_number or "", re.I):     # LN-xxxx = test data (to be purged) - never match
+                continue
             k = addr_key(l.property_address)
             if k:
                 by_addr.setdefault(k, []).append(l)
@@ -415,6 +442,10 @@ def run_once(dry_run=False, files=None, download=None):
             if not named:
                 return None, (f"address matches {', '.join(l.loan_number + ' ' + (l.borrower_name or '') for l in cands)} "
                               f"but that borrower's name is not on the approval")
+            if len(named) > 1:
+                active = [l for l in named if (l.stage or "").lower() in ACTIVE_PORTAL_STAGES]
+                if len(active) == 1 and doc.get("_folder_status") == "active":
+                    return active[0], None
             if len(named) > 1:
                 return None, f"more than one portal loan for '{doc['address']}': {', '.join(l.loan_number for l in named)}"
             return named[0], None
@@ -436,6 +467,7 @@ def run_once(dry_run=False, files=None, download=None):
                 _cache[f["id"]] = (f["etag"], doc)
             if doc is None:
                 skipped["not_an_approval"] += 1; continue
+            doc["_folder_status"] = f["folder_status"]
             loan, why = match(doc)
             if f["folder_status"] != "active":
                 if loan:
