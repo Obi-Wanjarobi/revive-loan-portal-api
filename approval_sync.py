@@ -390,6 +390,9 @@ ON_FILE_RULES = [
     (r"tax return|\b1040|transcript", r"\b1040|tax return|transcript", None),
     (r"pay ?stub|\bw-?2\b|\bvoe\b|employment history", r"pay ?stub|\bw-?2\b|\bvoe\b", None),
 ]
+# Conditions that are lender decisions/payments, not a document the borrower sends - never marked "on file".
+NOT_A_DOCUMENT = (r"\bdue\b|\bsecond\b|\bvalue\b|cash to close|ownership|vesting|must be from|settlement statement"
+                  r"|\bterms\b|restructur|\bfee\b|paid at closing|at closing")
 ON_FILE_NOTE = ("📄 We already have this on file (received {when}) - it's with the lender for review. "
                 "No need to send it again unless your processor asks for an updated copy. ")
 
@@ -423,8 +426,10 @@ def annotate_on_file(conditions, scoped, uploads):
     out = []
     for c in conditions:
         c = dict(c)
-        text = f"{c['title']} {c.get('detail', '')}".lower()
+        text = c["title"].lower()                     # title only: descriptions mention many documents in passing
         hits = []
+        if re.search(NOT_A_DOCUMENT, text, re.I):
+            out.append(c); continue
         for cond_pat, file_pat, not_pat in ON_FILE_RULES:
             if re.search(cond_pat, text, re.I):
                 hits += [d for name, d in pool if re.search(file_pat, name, re.I) and not (not_pat and re.search(not_pat, name, re.I))]
