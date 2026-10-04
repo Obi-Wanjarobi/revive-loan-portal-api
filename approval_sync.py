@@ -79,8 +79,22 @@ def first_date(t, *labels):
     return None
 
 
+_NOTE_STOP = r"(?=\s+(?:Must|Provide|Please|Borrower|Need|Include|All|The|A|An|If|To be|Copy|Signed|Evidence)\b|\.|$)"
+_DATE_NOTE = re.compile(r"(?:^|(?<=[.!?]\s)|(?<=-\s))\d{1,2}/\d{1,2}(?!/)\s*[A-Za-z][^.]*?" + _NOTE_STOP)
+_STAFF_SENTENCE = re.compile(r"\b(AM|AE|UW|Underwriter|Processor|Account Manager)\s+(to|will)\b", re.I)
+
+
+def clean_notes(text):
+    """Drop processor/lender notes: '8/27 HOI to update correct loan number', '9/9Check needs to be Voided',
+    and back-office sentences like 'AM to process through the Social Security Administration.'"""
+    text = _DATE_NOTE.sub("", text or "")
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    text = " ".join(x for x in sentences if not _STAFF_SENTENCE.search(x))
+    return clean(re.sub(r"\s+([.,;:])", r"\1", text))
+
+
 def cond(title, detail, label):
-    title, detail = clean(title), clean(detail)
+    title, detail = clean_notes(clean(title)), clean_notes(clean(detail))
     full = f"{title} {detail}"
     if not title or any(re.search(p, full, re.I) or re.search(p, title, re.I) for p in HIDE):
         return None
@@ -576,6 +590,27 @@ def run_once(dry_run=False, files=None, download=None, all_files=None):
                 help_items.append({"file": best[ln][3], "why": f"{ln} also has an approval in Mortgage {st.title()} - treated as closed. Not pushed."})
                 del best[ln]
 
+        # ---- stage corrections (forward only; OneDrive folder = processors' truth) ----
+        stages_fixed = []
+        order = ["application", "processing", "underwriting", "conditions", "clear to close", "funded"]
+
+        def set_stage(loan, new_stage, why):
+            old = loan.stage
+            stages_fixed.append({"loan": loan.loan_number, "borrower": loan.borrower_name, "from": old, "to": new_stage, "why": why})
+            if not dry_run:
+                loan.stage = new_stage
+                if hasattr(loan, "stage_date"):
+                    loan.stage_date = dt.datetime.utcnow()
+                db.add(models.ActivityEvent(loan_id=loan.id, text=f"Stage updated — moved to {new_stage}"))
+                db.commit()
+
+        by_ln = {l.loan_number: l for l in loans}
+        for ln, st in closed.items():
+            l = by_ln.get(ln)
+            if l and (l.stage or "").lower() in ACTIVE_PORTAL_STAGES:
+                set_stage(l, "Funded" if st == "funded" else "Withdrawn", f"approval is in Mortgage {st.title()}")
+        help_items = [h for h in help_items if "update the stage in the CRM" not in h["why"]]
+
         pushed = []
         for ln, (rank, loan, doc, rel, rel_parts) in sorted(best.items()):
             scoped = _scoped_files(rel_parts, addr_key(doc["address"]), all_files)
@@ -588,9 +623,13 @@ def run_once(dry_run=False, files=None, download=None, all_files=None):
                 res["titles"] = [c["title"] for c in conds]
             else:
                 res.update(merge_approval(db, loan, conds, doc["approval_date"] or doc["printed"]))
+            cur = (loan.stage or "").lower()
+            if cur in order and order.index(cur) < order.index("conditions"):
+                set_stage(loan, "Conditions", "lender issued a conditional approval")
             pushed.append(res)
-        STATUS.update(pushed=pushed, help=help_items, skipped=skipped, files_seen=len(files), dry_run=dry_run)
-        return {"dry_run": dry_run, "pushed": pushed, "help": help_items, "skipped": skipped, "files_seen": len(files)}
+        STATUS.update(pushed=pushed, help=help_items, skipped=skipped, files_seen=len(files), dry_run=dry_run, stages_fixed=stages_fixed)
+        return {"dry_run": dry_run, "pushed": pushed, "help": help_items, "skipped": skipped, "files_seen": len(files),
+                "stages_fixed": stages_fixed}
     except Exception as e:
         STATUS["last_error"] = f"{type(e).__name__}: {e}"
         traceback.print_exc()
