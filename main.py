@@ -9,12 +9,12 @@ Three doors into the same filing cabinet:
 import os
 from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
-from fastapi.responses import Response
+from fastapi.responses import Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
-import models, schemas, auth, approval_sync
+import models, schemas, auth, approval_sync, campaign
 from database import engine, get_db, Base
 
 Base.metadata.create_all(bind=engine)  # MVP: auto-create tables. Move to Alembic migrations once this is live.
@@ -215,6 +215,58 @@ def sync_conditions(loan_number: str, conditions: list[schemas.ConditionUpsert],
         db.add(models.Condition(loan_id=loan.id, title=c.title, detail=c.detail, done=c.done))
     db.commit()
     return {"status": "ok", "count": len(conditions)}
+
+
+# ---------- Branded client email campaign (Microsoft 365 / Graph) ----------
+@app.get("/u", response_class=HTMLResponse)
+def unsubscribe(e: str = "", t: str = "", db: Session = Depends(get_db)):
+    """Public one-click unsubscribe (link in every campaign email)."""
+    email = (e or "").strip().lower()
+    ok = bool(email) and campaign.hmac.compare_digest(t or "", campaign.unsub_token(email))
+    if ok and not db.query(models.EmailSuppression).filter(models.EmailSuppression.email == email).first():
+        db.add(models.EmailSuppression(email=email, reason="unsubscribe link")); db.commit()
+    msg = "You've been unsubscribed from Revive Capital marketing emails." if ok else "This unsubscribe link is invalid or expired."
+    return HTMLResponse(f"<html><body style='font-family:Arial;padding:40px;color:#1B2A4A'><h2>Revive Capital</h2><p>{msg}</p>"
+                        "<p>Questions about your loan? Call 949-735-0829.</p></body></html>")
+
+
+@app.get("/admin/campaign/recipients", dependencies=[Depends(auth.get_current_admin)])
+def campaign_recipients(db: Session = Depends(get_db)):
+    recips, skipped = campaign.recipients(db)
+    return {"campaign": campaign.CAMPAIGN_ID, "approved": campaign.approved(), "count": len(recips),
+            "recipients": recips, "skipped": skipped}
+
+
+@app.get("/admin/campaign/preview", response_class=HTMLResponse, dependencies=[Depends(auth.get_current_admin)])
+def campaign_preview(loan: str, db: Session = Depends(get_db)):
+    recips, _ = campaign.recipients(db)
+    r = next((x for x in recips if x["loan"] == loan), None)
+    if not r:
+        raise HTTPException(status_code=404, detail="Loan not in this campaign's recipient list.")
+    return HTMLResponse(campaign.render(r))
+
+
+@app.post("/admin/campaign/test", dependencies=[Depends(auth.get_current_admin)])
+def campaign_test(to: str, loan: str = ""):
+    try:
+        return campaign.send_test(to, loan or None)
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail=str(ex)[:300])
+
+
+@app.post("/admin/campaign/send", dependencies=[Depends(auth.get_current_admin)])
+def campaign_send(dry_run: bool = True, limit: int = 0, loans: str = ""):
+    if not dry_run and not campaign.approved():
+        raise HTTPException(status_code=403, detail="Blocked: set CAMPAIGN_APPROVED=yes in Railway once consent and the license line are cleared.")
+    import threading
+    threading.Thread(target=campaign.run, kwargs={"dry_run": dry_run, "limit": limit or None,
+                     "only_loans": [x for x in loans.split(",") if x] or None}, daemon=True).start()
+    return {"status": "started", "dry_run": dry_run, "check": "/admin/campaign/status"}
+
+
+@app.get("/admin/campaign/status", dependencies=[Depends(auth.get_current_admin)])
+def campaign_status():
+    return {**campaign.STATUS, "approved": campaign.approved()}
 
 
 # ---------- Automatic approval-conditions sync (OneDrive -> portal) ----------
