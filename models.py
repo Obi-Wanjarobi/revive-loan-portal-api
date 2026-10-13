@@ -169,3 +169,23 @@ class Form1003(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     loan = relationship("Loan")
+
+
+class EmailSuppression(Base):
+    """Permanent marketing opt-out list (unsubscribe link / STOP). Never email these addresses marketing again."""
+    __tablename__ = "email_suppressions"
+
+    email = Column(String, primary_key=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CampaignSend(Base):
+    """One row per (campaign, email) actually sent - prevents sending the same campaign twice."""
+    __tablename__ = "campaign_sends"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    campaign = Column(String, index=True, nullable=False)
+    email = Column(String, index=True, nullable=False)
+    loan_number = Column(String, nullable=True)
+    sent_at = Column(DateTime(timezone=True), server_default=func.now())
