@@ -125,8 +125,8 @@ def render(r):
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;background:#ffffff;border:1px solid #E1E6ED;border-radius:14px;">
  <tr><td bgcolor="#0F1E35" style="padding:20px 28px;border-radius:14px 14px 0 0;">
   <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
-   <td bgcolor="#1A5FA8" width="34" height="34" align="center" style="border-radius:8px;{font}font-size:17px;font-weight:bold;color:#ffffff;">R</td>
-   <td style="padding-left:10px;{font}"><div style="font-size:17px;font-weight:bold;color:#ffffff;">Revive Capital</div>
+   <td width="40" valign="middle"><img src="{PORTAL}/email-mark.png" width="40" height="37" alt="Revive Capital" style="display:block;border:0;outline:none;text-decoration:none;"></td>
+   <td style="padding-left:12px;{font}"><div style="font-size:19px;font-weight:bold;color:#ffffff;letter-spacing:-0.3px;">Revive <span style="color:#AEB6C4;">Capital</span></div>
    <div style="font-size:9px;letter-spacing:2px;color:#9AA5B3;">CLIENT PORTAL</div></td></tr></table>
  </td></tr>
  <tr><td style="padding:30px 28px 8px;{font}color:#1B2A4A;">
