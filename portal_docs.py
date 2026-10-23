@@ -121,6 +121,11 @@ def export_doc(db, doc, notify=True):
     loan = db.query(models.Loan).filter(models.Loan.id == doc.loan_id).first()
     if not loan:
         return None
+    if re.match(r"LN-", loan.loan_number or "", re.I) or \
+            re.search(r"\btest\b", f"{loan.borrower_name or ''} {loan.borrower_email or ''}", re.I):
+        db.add(models.DocumentExport(document_id=doc.id, onedrive_path="skipped: test loan"))   # never export test data
+        db.commit()
+        return None
     folder_path = borrower_folder(loan.borrower_name)
     stamp = (doc.created_at or dt.datetime.utcnow()).strftime("%Y-%m-%d")
     path = f"{_pipeline()}/{folder_path}/{SUBFOLDER}/{stamp} - {_safe(doc.filename)}"
