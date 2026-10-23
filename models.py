@@ -189,3 +189,13 @@ class CampaignSend(Base):
     email = Column(String, index=True, nullable=False)
     loan_number = Column(String, nullable=True)
     sent_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class DocumentExport(Base):
+    """One row per portal document copied into OneDrive (so each file is exported exactly once)."""
+    __tablename__ = "document_exports"
+
+    document_id = Column(String, primary_key=True)
+    onedrive_path = Column(String, nullable=True)
+    web_url = Column(String, nullable=True)
+    exported_at = Column(DateTime(timezone=True), server_default=func.now())
