@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
-import models, schemas, auth, approval_sync, campaign
+import models, schemas, auth, approval_sync, campaign, portal_docs
 from database import engine, get_db, Base
 
 Base.metadata.create_all(bind=engine)  # MVP: auto-create tables. Move to Alembic migrations once this is live.
@@ -113,6 +113,7 @@ async def upload_my_document(
     db.add(models.ActivityEvent(loan_id=current_borrower.loan_id, text=f"You uploaded {file.filename}"))
     db.commit()
     db.refresh(doc)
+    portal_docs.export_now(doc.id)          # copy to the borrower's OneDrive folder + alert Jay
     return doc
 
 
@@ -273,6 +274,44 @@ def campaign_status():
 @app.on_event("startup")
 def _start_approval_sync():
     approval_sync.start_scheduler()
+    portal_docs.start_scheduler()
+
+
+# ---------- Portal uploads: admin view + OneDrive export ----------
+@app.get("/admin/loans/{loan_number}/documents", dependencies=[Depends(auth.get_current_admin)])
+def admin_list_documents(loan_number: str, db: Session = Depends(get_db)):
+    loan = db.query(models.Loan).filter(models.Loan.loan_number == loan_number).first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Unknown loan number.")
+    docs = db.query(models.Document).filter(models.Document.loan_id == loan.id).order_by(models.Document.created_at.desc()).all()
+    ex = {e.document_id: e for e in db.query(models.DocumentExport).filter(models.DocumentExport.document_id.in_([d.id for d in docs])).all()} if docs else {}
+    return [{"id": d.id, "filename": d.filename, "doc_type": d.doc_type, "uploaded_by_role": d.uploaded_by_role,
+             "created_at": d.created_at, "size": len(d.data or b""),
+             "onedrive_path": ex[d.id].onedrive_path if d.id in ex else None,
+             "onedrive_url": ex[d.id].web_url if d.id in ex else None} for d in docs]
+
+
+@app.get("/admin/documents/{document_id}/download", dependencies=[Depends(auth.get_current_admin)])
+def admin_download_document(document_id: str, db: Session = Depends(get_db)):
+    doc = db.query(models.Document).filter(models.Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return Response(content=doc.data, media_type=doc.content_type or "application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{doc.filename}"'})
+
+
+@app.post("/admin/portal-docs/sweep", dependencies=[Depends(auth.get_current_admin)])
+def admin_portal_docs_sweep():
+    if not portal_docs.enabled():
+        raise HTTPException(status_code=400, detail="OneDrive export is off or not configured.")
+    import threading
+    threading.Thread(target=portal_docs.sweep, daemon=True).start()
+    return {"status": "started", "check": "/admin/portal-docs/status"}
+
+
+@app.get("/admin/portal-docs/status", dependencies=[Depends(auth.get_current_admin)])
+def admin_portal_docs_status():
+    return {**portal_docs.STATUS, "enabled": portal_docs.enabled()}
 
 
 @app.get("/admin/approval-sync/status", dependencies=[Depends(auth.get_current_admin)])
