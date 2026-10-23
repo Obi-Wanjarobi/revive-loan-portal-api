@@ -346,8 +346,8 @@ def _walk(item_path, status, rel_parts, out, depth=0, all_files=None):
         for it in page.get("value", []):
             name = it["name"]
             if "folder" in it:
-                if "do not use" in name.lower():
-                    continue
+                if "do not use" in name.lower() or re.search(r"\btest\b", name, re.I):
+                    continue                                  # skip "Do Not Use" and test-borrower folders
                 _walk(f"{item_path}/{name}", status, rel_parts + [name], out, depth + 1, all_files)
                 continue
             if all_files is not None and "file" in it:
