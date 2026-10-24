@@ -173,6 +173,29 @@ def _name_short(full: Optional[str]) -> str:
     return parts[0] + (" " + parts[-1][0].upper() + "." if len(parts) > 1 else "")
 
 
+PORTAL_URL = "https://pulse-broker-portal.netlify.app"
+
+
+def _email_broker(b, subject: str, body_html: str):
+    """Transactional email to the broker's own address. Never includes borrower details
+    (BETA: no borrower PII to external parties). Sent in the background; failure never blocks."""
+    e = html.escape
+    full = (f"<div style='font-family:Arial,sans-serif;color:#1B2A4A;font-size:14px;line-height:1.5'>"
+            f"<p>Hi {e((b.full_name or '').split(' ')[0] or 'there')},</p>{body_html}"
+            f"<p><a href='{PORTAL_URL}'>Open the Pulse Broker Portal</a></p>"
+            f"<p style='color:#6B7686;font-size:12px'>Jay Turner · Revive Capital · www.myrevivecapital.com · 949-735-0829<br>"
+            f"Please don't email borrower documents. Upload them in the portal.</p></div>")
+
+    def go():
+        try:
+            import campaign
+            campaign.send_one(b.email, subject, full)
+        except Exception:
+            pass
+    import threading
+    threading.Thread(target=go, daemon=True).start()
+
+
 def _notify(subject: str, body: str):
     """Internal alert to Jay only. Never includes borrower details; failure never blocks the request."""
     try:
@@ -396,10 +419,15 @@ def admin_broker_status(broker_id: str, p: StatusIn, db: Session = Depends(get_d
     b = db.query(Broker).filter(Broker.id == broker_id).first()
     if not b:
         raise HTTPException(status_code=404, detail="Broker not found.")
+    was = b.status
     b.status = p.status
     if p.status == "active" and not b.approved_at:
         b.approved_at = datetime.datetime.now(datetime.timezone.utc)
     db.commit()
+    if p.status == "active" and was != "active":
+        _email_broker(b, "Your Revive Broker Portal access is approved",
+                      "<p>Your Pulse Broker Portal account is approved. Log in with the email and password you chose "
+                      "to run scenarios, submit deals and track your files with Revive Capital.</p>")
     return {"id": b.id, "status": b.status}
 
 
@@ -444,6 +472,7 @@ def admin_submission_status(sub_id: str, p: StatusIn, loan_number: Optional[str]
     s = db.query(BrokerSubmission).filter(BrokerSubmission.id == sub_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Submission not found.")
+    was = s.status
     s.status = p.status
     s.status_note = p.note
     if loan_number:
@@ -454,6 +483,13 @@ def admin_submission_status(sub_id: str, p: StatusIn, loan_number: Optional[str]
         if not db.query(BrokerLoan).filter(BrokerLoan.broker_id == s.broker_id, BrokerLoan.loan_id == loan.id).first():
             db.add(BrokerLoan(broker_id=s.broker_id, loan_id=loan.id))
     db.commit()
+    if p.status != was and p.status in ("reviewing", "accepted", "declined"):
+        b = db.query(Broker).filter(Broker.id == s.broker_id).first()
+        if b and b.status == "active":
+            msg = {"reviewing": "is being reviewed by Revive",
+                   "accepted": "was accepted. Revive will reach out to the borrower and you'll see the file in My Pipeline",
+                   "declined": "wasn't a fit for Revive right now. Log in for details or call us to talk it through"}[p.status]
+            _email_broker(b, f"Deal {s.ref} update: {p.status}", f"<p>Your deal <b>{html.escape(s.ref)}</b> {msg}.</p>")
     return _sub_view(s)
 
 
