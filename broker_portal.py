@@ -34,6 +34,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
+from sqlalchemy import JSON as JSONType
 
 import auth
 import models
@@ -454,3 +455,210 @@ def admin_submission_status(sub_id: str, p: StatusIn, loan_number: Optional[str]
             db.add(BrokerLoan(broker_id=s.broker_id, loan_id=loan.id))
     db.commit()
     return _sub_view(s)
+
+
+# ============================================================
+# SCENARIO RUNNER — brokers check eligibility WITHOUT seeing lenders
+# ============================================================
+# The lender guideline library (lender names, program names, source files,
+# overlays, notes) is uploaded by the admin and stored ONLY in Postgres —
+# never in this public repo and never sent to a broker. Brokers get back
+# anonymous option codes (e.g. "DSCR-03") plus structured limits.
+
+class BrokerProgramSet(Base):
+    __tablename__ = "broker_program_sets"
+    id = Column(String, primary_key=True, default=models.gen_uuid)
+    data = Column(JSONType, nullable=False)          # {"programs":[...], "codes":{program_id: code}}
+    program_count = Column(Integer, nullable=False, default=0)
+    source_label = Column(String, nullable=True)
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class BrokerScenarioRun(Base):
+    __tablename__ = "broker_scenario_runs"
+    id = Column(String, primary_key=True, default=models.gen_uuid)
+    broker_id = Column(String, ForeignKey("brokers.id"), nullable=False, index=True)
+    inputs = Column(JSONType, nullable=False)
+    matched_codes = Column(JSONType, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ScenarioIn(BaseModel):
+    product: Optional[str] = Field(default=None, max_length=40)       # loan type, or None = all
+    purpose: str = Field(pattern=r"^(purchase|rate_term|cash_out)$")
+    occupancy: str = Field(pattern=r"^(primary|second_home|investment)$")
+    property_type: Optional[str] = Field(default=None, max_length=40)
+    property_state: str = Field(pattern=r"^[A-Za-z]{2}$")
+    fico: int = Field(ge=300, le=850)
+    value: int = Field(gt=0, le=100_000_000)
+    loan_amount: int = Field(gt=0, le=100_000_000)
+    dscr: Optional[float] = Field(default=None, ge=0, le=10)
+    first_time_investor: bool = False
+
+
+_ABBR = {"DSCR": "DSCR", "Bank Statement": "BANK", "P&L": "PL", "Asset Depletion": "ASSET", "Full Doc": "FULL",
+         "ITIN": "ITIN", "Foreign National": "FN", "Bridge": "BRDG", "Fix & Flip": "FLIP", "HELOC": "HELOC",
+         "HELOAN": "HELOAN", "Conventional": "CONV", "FHA": "FHA", "VA": "VA", "Jumbo": "JUMBO", "Commercial": "COMM"}
+_PTYPE = {"Single family": ["SFR", "Townhome", "Rural"], "Condo": ["Condo", "Non-Warrantable Condo", "Condotel"],
+          "2–4 unit": ["2-4 Unit"], "5–8 unit": ["5+ Multifamily"], "Mixed use / commercial": ["Mixed Use", "5+ Multifamily"],
+          "Manufactured": ["Manufactured"]}
+
+
+def _assign_codes(programs: list) -> dict:
+    counters, codes = {}, {}
+    for p in sorted(programs, key=lambda x: str(x.get("id"))):
+        cat = (p.get("loan_types") or ["OTHER"])[0]
+        ab = _ABBR.get(cat, "OPT")
+        counters[ab] = counters.get(ab, 0) + 1
+        codes[str(p.get("id"))] = f"{ab}-{counters[ab]:02d}"
+    return codes
+
+
+def _current_programs(db: Session):
+    return db.query(BrokerProgramSet).order_by(BrokerProgramSet.uploaded_at.desc()).first()
+
+
+def _eval_program(p: dict, s: "ScenarioIn", ltv: float):
+    """Returns (eligible, max_ltv_at_profile or None, reason or None). reason None + not eligible = different product."""
+    lts = p.get("loan_types") or []
+    if not lts:
+        return False, None, None  # unclassified program: never offered automatically
+    if s.product and s.product not in lts:
+        return False, None, None
+    # Hard product rules, applied even when a program's own data is incomplete
+    if set(lts) <= {"DSCR", "Foreign National", "Fix & Flip", "Commercial", "Bridge"} and s.occupancy != "investment" and not (set(lts) & {"Bridge"}):
+        return False, None, "occupancy"
+    if set(lts) <= {"FHA", "VA"} and s.occupancy != "primary":
+        return False, None, "occupancy"
+    if set(lts) <= {"HELOC", "HELOAN"} and s.purpose == "purchase":
+        return False, None, "purpose"
+    occ = p.get("occupancy") or []
+    if occ and s.occupancy not in occ:
+        return False, None, "occupancy"
+    pur = p.get("purposes") or []
+    if pur and s.purpose not in pur:
+        return False, None, "purpose"
+    if s.property_state.upper() in [str(x).upper() for x in (p.get("states_excluded") or [])]:
+        return False, None, "state"
+    pts = p.get("property_types") or []
+    if pts and s.property_type in _PTYPE and not set(_PTYPE[s.property_type]) & set(pts):
+        return False, None, "property type"
+    if p.get("min_fico") and s.fico < p["min_fico"]:
+        return False, None, "credit score"
+    if p.get("min_loan") and s.loan_amount < p["min_loan"]:
+        return False, None, "loan amount"
+    if p.get("max_loan") and s.loan_amount > p["max_loan"]:
+        return False, None, "loan amount"
+    if s.dscr is not None and p.get("min_dscr") and s.dscr < float(p["min_dscr"]):
+        return False, None, "DSCR"
+    if s.first_time_investor and str(p.get("first_time_investor") or "").lower().startswith("not"):
+        return False, None, "first-time investor"
+    tiers = p.get("fico_tiers") or []
+    if tiers:
+        caps = []
+        for t in tiers:
+            if t.get("min_fico") and s.fico < t["min_fico"]:
+                continue
+            if t.get("max_fico") and s.fico > t["max_fico"]:
+                continue
+            if t.get("min_loan") and s.loan_amount < t["min_loan"]:
+                continue
+            if t.get("max_loan") and s.loan_amount > t["max_loan"]:
+                continue
+            if t.get("purposes") and s.purpose not in t["purposes"]:
+                continue
+            if t.get("occupancy") and s.occupancy not in t["occupancy"]:
+                continue
+            if t.get("positions") and 1 not in t["positions"] and "HELOC" not in lts and "HELOAN" not in lts:
+                continue
+            v = t.get("max_cltv") or t.get("max_ltv")
+            if v:
+                caps.append(float(v))
+        if not caps:
+            return False, None, "outside program grid"
+        cap = max(caps)
+    else:
+        v = [x for x in (p.get("max_ltv"), p.get("max_cltv")) if x]
+        cap = float(max(v)) if v else None
+    if cap is not None and ltv > cap + 1e-9:
+        return False, cap, "LTV"
+    return True, cap, None
+
+
+@router.post("/broker/scenario")
+def broker_scenario(s: ScenarioIn, b: Broker = Depends(current_broker), db: Session = Depends(get_db)):
+    row = _current_programs(db)
+    if not row:
+        raise HTTPException(status_code=503, detail="The scenario tool isn't loaded yet. Submit the deal and Revive will review it.")
+    progs, codes = row.data.get("programs", []), row.data.get("codes", {})
+    ltv = s.loan_amount / s.value * 100
+    options, reasons, near = [], {}, []
+    for p in progs:
+        ok, cap, why = _eval_program(p, s, ltv)
+        code = codes.get(str(p.get("id")), "OPT")
+        cat = s.product or (p.get("loan_types") or ["Other"])[0]
+        if ok:
+            options.append({"code": code, "category": cat, "max_ltv": cap,
+                            "confirm": not (p.get("occupancy") and p.get("purposes") and cap is not None),
+                            "min_fico": p.get("min_fico"), "min_dscr": p.get("min_dscr"),
+                            "loan_range": [p.get("min_loan"), p.get("max_loan")],
+                            "first_time_investor": p.get("first_time_investor"),
+                            "prepay_applies": bool(p.get("prepay"))})
+        elif why:
+            reasons[why] = reasons.get(why, 0) + 1
+            if why == "LTV" and cap:
+                near.append({"code": code, "category": cat, "max_ltv": cap})
+    options.sort(key=lambda o: (-(o["max_ltv"] or 0), o["code"]))
+    near.sort(key=lambda o: -o["max_ltv"])
+    db.add(BrokerScenarioRun(broker_id=b.id, inputs=s.dict(), matched_codes=[o["code"] for o in options]))
+    db.commit()
+    return {"ltv": round(ltv, 2), "options": options, "near_misses": near[:5],
+            "not_eligible_reasons": reasons, "library_date": row.uploaded_at,
+            "disclaimer": "Indicative only, from general program guidelines. Not a loan approval, rate quote or commitment to lend. Revive confirms eligibility after review."}
+
+
+@router.post("/admin/scenario-programs", dependencies=ADMIN)
+def admin_upload_programs(payload: dict, db: Session = Depends(get_db)):
+    progs = payload.get("programs")
+    if not isinstance(progs, list) or not progs:
+        raise HTTPException(status_code=400, detail="Upload the lender programs JSON (it needs a 'programs' list).")
+    for p in progs:
+        if not isinstance(p, dict) or "id" not in p:
+            raise HTTPException(status_code=400, detail="Every program needs an 'id'.")
+    row = BrokerProgramSet(data={"programs": progs, "codes": _assign_codes(progs)}, program_count=len(progs),
+                           source_label=str(payload.get("built") or payload.get("version") or "")[:80])
+    db.add(row)
+    db.commit()
+    return {"programs": len(progs), "uploaded_at": row.uploaded_at}
+
+
+@router.get("/admin/scenario-programs", dependencies=ADMIN)
+def admin_program_codes(db: Session = Depends(get_db)):
+    """Admin-only key: option code -> real lender + program."""
+    row = _current_programs(db)
+    if not row:
+        return {"loaded": False, "codes": []}
+    codes = row.data.get("codes", {})
+    out = [{"code": codes.get(str(p.get("id"))), "lender": p.get("lender"), "program": p.get("program")}
+           for p in row.data.get("programs", [])]
+    out.sort(key=lambda x: x["code"] or "")
+    return {"loaded": True, "uploaded_at": row.uploaded_at, "source_label": row.source_label, "codes": out}
+
+
+@router.get("/admin/broker-scenarios", dependencies=ADMIN)
+def admin_scenarios(db: Session = Depends(get_db)):
+    rows = (db.query(BrokerScenarioRun, Broker).join(Broker, Broker.id == BrokerScenarioRun.broker_id)
+            .order_by(BrokerScenarioRun.created_at.desc()).limit(200).all())
+    return [{"at": r.created_at, "broker": b.full_name, "company": b.company, "inputs": r.inputs,
+             "matched": r.matched_codes or []} for r, b in rows]
+
+
+@router.get("/admin/broker-uploads", dependencies=ADMIN)
+def admin_broker_uploads(db: Session = Depends(get_db)):
+    rows = (db.query(models.Document.id, models.Document.filename, models.Document.doc_type, models.Document.content_type,
+                     models.Document.uploaded_by_name, models.Document.created_at, models.Loan.loan_number, models.Loan.borrower_name)
+            .join(models.Loan, models.Loan.id == models.Document.loan_id)
+            .filter(models.Document.uploaded_by_role == "broker")
+            .order_by(models.Document.created_at.desc()).limit(500).all())
+    return [{"id": r[0], "filename": r[1], "doc_type": r[2], "content_type": r[3], "uploaded_by": r[4],
+             "created_at": r[5], "loan_number": r[6], "borrower": r[7]} for r in rows]
