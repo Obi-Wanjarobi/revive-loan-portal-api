@@ -15,11 +15,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 import models, schemas, auth, approval_sync, campaign, portal_docs, admin_dashboard
+import broker_portal  # Pulse Broker Portal: registers its tables before create_all
 from database import engine, get_db, Base
 
 Base.metadata.create_all(bind=engine)  # MVP: auto-create tables. Move to Alembic migrations once this is live.
 
 app = FastAPI(title="Revive Capital Client Portal API")
+app.include_router(broker_portal.router)
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15MB per file — plenty for a scanned PDF, keeps Postgres storage sane
 
