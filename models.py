@@ -199,3 +199,23 @@ class DocumentExport(Base):
     onedrive_path = Column(String, nullable=True)
     web_url = Column(String, nullable=True)
     exported_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AppSetting(Base):
+    """Small key/value settings store (e.g. dashboard compensation assumptions)."""
+    __tablename__ = "app_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(JSON, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class DeletedLoan(Base):
+    """Archive of loans deleted from the admin dashboard (full copy, so they can be restored)."""
+    __tablename__ = "deleted_loans"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    loan_number = Column(String, index=True, nullable=False)
+    data = Column(JSON, nullable=False)
+    deleted_by = Column(String, nullable=True)
+    deleted_at = Column(DateTime(timezone=True), server_default=func.now())
