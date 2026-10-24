@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
-import models, schemas, auth, approval_sync, campaign, portal_docs
+import models, schemas, auth, approval_sync, campaign, portal_docs, admin_dashboard
 from database import engine, get_db, Base
 
 Base.metadata.create_all(bind=engine)  # MVP: auto-create tables. Move to Alembic migrations once this is live.
@@ -275,6 +275,44 @@ def campaign_status():
 def _start_approval_sync():
     approval_sync.start_scheduler()
     portal_docs.start_scheduler()
+
+
+# ---------- Owner dashboard ----------
+@app.get("/admin/overview", dependencies=[Depends(auth.get_current_admin)])
+def admin_overview(db: Session = Depends(get_db)):
+    return admin_dashboard.overview(db)
+
+
+@app.get("/admin/settings/comp", dependencies=[Depends(auth.get_current_admin)])
+def admin_get_comp(db: Session = Depends(get_db)):
+    return admin_dashboard.get_settings(db)
+
+
+@app.put("/admin/settings/comp", dependencies=[Depends(auth.get_current_admin)])
+def admin_put_comp(value: dict, db: Session = Depends(get_db)):
+    return admin_dashboard.save_settings(db, value)
+
+
+@app.delete("/admin/loans/{loan_number}", dependencies=[Depends(auth.get_current_admin)])
+def admin_delete_loan(loan_number: str, confirm: str = "", db: Session = Depends(get_db)):
+    code, msg = admin_dashboard.delete_loan(db, loan_number, confirm)
+    if code != 200:
+        raise HTTPException(status_code=code, detail=msg)
+    return {"status": "deleted", "detail": msg}
+
+
+@app.get("/admin/deleted", dependencies=[Depends(auth.get_current_admin)])
+def admin_deleted(db: Session = Depends(get_db)):
+    return [{"loan_number": d.loan_number, "borrower": (d.data or {}).get("borrower_name"), "deleted_at": d.deleted_at}
+            for d in db.query(models.DeletedLoan).order_by(models.DeletedLoan.deleted_at.desc()).all()]
+
+
+@app.post("/admin/deleted/{loan_number}/restore", dependencies=[Depends(auth.get_current_admin)])
+def admin_restore(loan_number: str, db: Session = Depends(get_db)):
+    code, msg = admin_dashboard.restore_loan(db, loan_number)
+    if code != 200:
+        raise HTTPException(status_code=code, detail=msg)
+    return {"status": "restored"}
 
 
 # ---------- Portal uploads: admin view + OneDrive export ----------
