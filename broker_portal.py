@@ -35,6 +35,7 @@ from sqlalchemy import Column, String, Integer, Boolean, DateTime, ForeignKey, T
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 from sqlalchemy import JSON as JSONType
+from sqlalchemy import LargeBinary as LargeBinaryType
 
 import auth
 import models
@@ -322,8 +323,9 @@ def broker_login(p: BrokerLogin, db: Session = Depends(get_db)):
 
 
 @router.get("/broker/me")
-def broker_me(b: Broker = Depends(current_broker)):
-    return {"full_name": b.full_name, "company": b.company, "email": b.email, "nmls_id": b.nmls_id}
+def broker_me(b: Broker = Depends(current_broker), db: Session = Depends(get_db)):
+    return {"full_name": b.full_name, "company": b.company, "email": b.email, "nmls_id": b.nmls_id,
+            "w9_status": _w9_status(db, b.id)}
 
 
 @router.get("/broker/pipeline")
@@ -339,6 +341,7 @@ def broker_pipeline(b: Broker = Depends(current_broker), db: Session = Depends(g
 def broker_submit(p: SubmissionIn, b: Broker = Depends(current_broker), db: Session = Depends(get_db)):
     if not p.consent_attested:
         raise HTTPException(status_code=400, detail="Confirm the borrower agreed to be contacted before submitting.")
+    _require_w9(db, b)
     _reject_sensitive(p.notes)
     _reject_sensitive(p.borrower_first)
     n = db.query(BrokerSubmission).count()
@@ -362,6 +365,7 @@ def broker_submit(p: SubmissionIn, b: Broker = Depends(current_broker), db: Sess
 @router.post("/broker/loans/{loan_number}/documents")
 async def broker_upload(loan_number: str, file: UploadFile = File(...), doc_type: str = Form(None),
                         b: Broker = Depends(current_broker), db: Session = Depends(get_db)):
+    _require_w9(db, b)
     loan = _linked_loan(db, b, loan_number)
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
@@ -408,7 +412,7 @@ def admin_brokers(db: Session = Depends(get_db)):
         out.append({"id": b.id, "full_name": b.full_name, "company": b.company, "email": b.email, "phone": b.phone,
                     "nmls_id": b.nmls_id, "company_nmls_id": b.company_nmls_id, "states": b.states, "status": b.status,
                     "created_at": b.created_at, "approved_at": b.approved_at, "last_login_at": b.last_login_at,
-                    "loans": [l[0] for l in links]})
+                    "loans": [l[0] for l in links], "w9": _w9_admin_view(db, b.id)})
     return out
 
 
@@ -427,7 +431,9 @@ def admin_broker_status(broker_id: str, p: StatusIn, db: Session = Depends(get_d
     if p.status == "active" and was != "active":
         _email_broker(b, "Your Revive Broker Portal access is approved",
                       "<p>Your Pulse Broker Portal account is approved. Log in with the email and password you chose "
-                      "to run scenarios, submit deals and track your files with Revive Capital.</p>")
+                      "to run scenarios, submit deals and track your files with Revive Capital.</p>"
+                      "<p>First step after you log in: upload a signed IRS Form W-9 for your company. "
+                      "It's required before you can run scenarios or submit deals.</p>")
     return {"id": b.id, "status": b.status}
 
 
@@ -623,6 +629,7 @@ def _eval_program(p: dict, s: "ScenarioIn", ltv: float):
 
 @router.post("/broker/scenario")
 def broker_scenario(s: ScenarioIn, b: Broker = Depends(current_broker), db: Session = Depends(get_db)):
+    _require_w9(db, b)
     row = _current_programs(db)
     if not row:
         raise HTTPException(status_code=503, detail="The scenario tool isn't loaded yet. Submit the deal and Revive will review it.")
@@ -698,3 +705,96 @@ def admin_broker_uploads(db: Session = Depends(get_db)):
             .order_by(models.Document.created_at.desc()).limit(500).all())
     return [{"id": r[0], "filename": r[1], "doc_type": r[2], "content_type": r[3], "uploaded_by": r[4],
              "created_at": r[5], "loan_number": r[6], "borrower": r[7]} for r in rows]
+
+
+# ============================================================
+# W-9 — mandatory before a broker can run scenarios, submit deals or upload
+# ============================================================
+# The W-9 carries the broker's TIN (SSN or EIN): stored only in Postgres,
+# never emailed, never exported to OneDrive, never shown back to the broker.
+# Only the admin can open it.
+
+class BrokerDocument(Base):
+    __tablename__ = "broker_documents"
+    id = Column(String, primary_key=True, default=models.gen_uuid)
+    broker_id = Column(String, ForeignKey("brokers.id"), nullable=False, index=True)
+    kind = Column(String, nullable=False, default="w9")
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=False)
+    data = Column(LargeBinaryType, nullable=False)
+    status = Column(String, nullable=False, default="pending")  # pending | approved | rejected
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+W9_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _latest_w9(db: Session, broker_id: str):
+    return (db.query(BrokerDocument).filter(BrokerDocument.broker_id == broker_id, BrokerDocument.kind == "w9")
+            .order_by(BrokerDocument.created_at.desc()).first())
+
+
+def _w9_status(db: Session, broker_id: str) -> str:
+    d = _latest_w9(db, broker_id)
+    return d.status if d else "missing"
+
+
+def _w9_admin_view(db: Session, broker_id: str):
+    d = _latest_w9(db, broker_id)
+    if not d:
+        return {"status": "missing"}
+    return {"status": d.status, "id": d.id, "filename": d.filename, "uploaded_at": d.created_at}
+
+
+def _require_w9(db: Session, b):
+    if _w9_status(db, b.id) not in ("pending", "approved"):
+        raise HTTPException(status_code=403, detail="Upload your signed W-9 first (My Pipeline tab). It's required before you can run scenarios, submit deals or upload files.")
+
+
+@router.post("/broker/w9")
+async def broker_upload_w9(file: UploadFile = File(...), b: Broker = Depends(current_broker), db: Session = Depends(get_db)):
+    content = await file.read()
+    if len(content) > W9_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="That file is too large. Keep the W-9 under 10MB.")
+    ctype = _sniff(content)
+    if not ctype:
+        raise HTTPException(status_code=415, detail="Upload the W-9 as a PDF, JPG or PNG.")
+    if _w9_status(db, b.id) == "approved":
+        raise HTTPException(status_code=409, detail="Your W-9 is already approved. Contact Revive if it needs to change.")
+    db.add(BrokerDocument(broker_id=b.id, kind="w9", filename=(file.filename or "w9")[:200], content_type=ctype,
+                          data=content, status="pending"))
+    db.commit()
+    _notify(f"W-9 received: {b.company}",
+            f"<p><b>{html.escape(b.company)}</b> uploaded a W-9 in the Broker Portal. Review it in the Admin tab.</p>")
+    return {"w9_status": "pending"}
+
+
+@router.get("/admin/broker-w9/{doc_id}/download", dependencies=ADMIN)
+def admin_w9_download(doc_id: str, db: Session = Depends(get_db)):
+    from fastapi.responses import Response
+    d = db.query(BrokerDocument).filter(BrokerDocument.id == doc_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="W-9 not found.")
+    return Response(content=d.data, media_type=d.content_type,
+                    headers={"Content-Disposition": f'inline; filename="{d.filename}"', "Cache-Control": "no-store"})
+
+
+@router.post("/admin/broker-w9/{doc_id}/status", dependencies=ADMIN)
+def admin_w9_status(doc_id: str, p: StatusIn, db: Session = Depends(get_db)):
+    if p.status not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="Status must be approved or rejected.")
+    d = db.query(BrokerDocument).filter(BrokerDocument.id == doc_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="W-9 not found.")
+    was = d.status
+    d.status = p.status
+    d.reviewed_at = datetime.datetime.now(datetime.timezone.utc)
+    db.commit()
+    if p.status == "rejected" and was != "rejected":
+        b = db.query(Broker).filter(Broker.id == d.broker_id).first()
+        if b and b.status == "active":
+            _email_broker(b, "Please re-upload your W-9",
+                          "<p>We couldn't accept the W-9 you uploaded. Please log in and upload a complete, signed, "
+                          "current IRS Form W-9 for your company. Don't email it to us; upload it in the portal.</p>")
+    return {"id": d.id, "status": d.status}
